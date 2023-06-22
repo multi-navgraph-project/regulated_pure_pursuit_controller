@@ -145,6 +145,11 @@ namespace regulated_pure_pursuit_controller{
 
     geometry_msgs::PoseStamped getLookAheadPoint(
       const double & lookahead_dist, const std::vector<geometry_msgs::PoseStamped>& transformed_plan);
+
+      geometry_msgs::Point circleSegmentIntersection(
+        const geometry_msgs::Point &p1,
+        const geometry_msgs::Point &p2,
+        double r);
     
     double getLookAheadDistance( const geometry_msgs::Twist & speed);
 

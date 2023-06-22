@@ -72,7 +72,7 @@ namespace regulated_pure_pursuit_controller
 
         nh.param<double>("max_robot_pose_search_dist", max_robot_pose_search_dist_, getCostmapMaxExtent());
 
-        nh.param<int>("min_global_plan_complete_size", min_global_plan_complete_size_, 20);
+        nh.param<int>("min_global_plan_complete_size", min_global_plan_complete_size_, 30);
         nh.param<double>("global_plan_prune_distance", global_plan_prune_distance_, 1.0);
     
         //Lookahead
@@ -187,6 +187,25 @@ namespace regulated_pure_pursuit_controller
         return true;
     }
 
+    double calculateCurvature(geometry_msgs::Point lookahead_point)
+    {
+        // Find distance^2 to look ahead point (carrot) in robot base frame
+        // This is the chord length of the circle
+        const double carrot_dist2 =
+            (lookahead_point.x * lookahead_point.x) +
+            (lookahead_point.y * lookahead_point.y);
+
+        // Find curvature of circle (k = 1 / R)
+        if (carrot_dist2 > 0.001)
+        {
+            return 2.0 * lookahead_point.y / carrot_dist2;
+        }
+        else
+        {
+            return 0.0;
+        }
+    }
+
 
     uint32_t RegulatedPurePursuitController::computeVelocityCommands(const geometry_msgs::PoseStamped& pose,
                                                         const geometry_msgs::TwistStamped& velocity,
@@ -240,9 +259,11 @@ namespace regulated_pure_pursuit_controller
         tf2::doTransform(global_plan_.back(), global_goal, tf_plan_to_robot_frame);
         double dx_2 = global_goal.pose.position.x * global_goal.pose.position.x;
         double dy_2 = global_goal.pose.position.y * global_goal.pose.position.y;
+        ROS_INFO("global size  : %zu | dist : %f", global_plan_.size(), fabs(std::sqrt(dx_2 + dy_2)));
 
         if(fabs(std::sqrt(dx_2 + dy_2)) < goal_dist_tol_ && global_plan_.size() <= min_global_plan_complete_size_)
         {
+            ROS_INFO("REACHED !!!!");
             goal_reached_ = true;
             return mbf_msgs::ExePathResult::SUCCESS;
         }
@@ -262,24 +283,32 @@ namespace regulated_pure_pursuit_controller
         geometry_msgs::PoseStamped carrot_pose = getLookAheadPoint(lookahead_dist, transformed_plan);
         carrot_pub_.publish(createCarrotMsg(carrot_pose));
 
-        //Carrot distance squared
-        const double carrot_dist2 =
+        double lookahead_curvature = calculateCurvature(carrot_pose.pose.position);
+
+        const double c_dist2 =
             (carrot_pose.pose.position.x * carrot_pose.pose.position.x) +
             (carrot_pose.pose.position.y * carrot_pose.pose.position.y);
 
-        // Find curvature of circle (k = 1 / R)
-        double curvature = 0.0;
-        if (carrot_dist2 > 0.001) {
-            curvature = 2.0 * carrot_pose.pose.position.y / carrot_dist2;
+        double regulation_curvature = lookahead_curvature;
+        bool use_fixed_curvature_lookahead = false;
+        double curvature_lookahead_dist = 1;
+        if (use_fixed_curvature_lookahead)
+        {
+            auto curvature_lookahead_pose = getLookAheadPoint(
+                curvature_lookahead_dist,
+                transformed_plan);
+            regulation_curvature = calculateCurvature(curvature_lookahead_pose.pose.position);
         }
 
-        //Set reversal
         double sign = 1.0;
-        if (allow_reversing_) {
+        if (allow_reversing_)
+        {
             sign = carrot_pose.pose.position.x >= 0.0 ? 1.0 : -1.0;
         }
 
         linear_vel = desired_linear_vel_;
+
+        
         // Make sure we're in compliance with basic constraints
         double angle_to_heading;
 
@@ -296,11 +325,11 @@ namespace regulated_pure_pursuit_controller
         else {
             //Constrain linear velocity
             applyConstraints(
-                std::fabs(lookahead_dist - sqrt(carrot_dist2)),
-                lookahead_dist, curvature, speed,
+                std::fabs(lookahead_dist - sqrt(c_dist2)),
+                lookahead_dist, regulation_curvature, speed,
                 costAtPose(robot_pose.pose.position.x, robot_pose.pose.position.y), linear_vel, sign);
             // Apply curvature to angular velocity after constraining linear velocity
-            angular_vel = linear_vel * curvature;
+            angular_vel = linear_vel * lookahead_curvature;
             //Ensure that angular_vel does not exceed user-defined amount
             angular_vel = std::clamp(angular_vel, -max_angular_vel_, max_angular_vel_);
         }
@@ -433,7 +462,42 @@ namespace regulated_pure_pursuit_controller
     /**
      * Calculation methods 
      */
-    
+
+    geometry_msgs::Point RegulatedPurePursuitController::circleSegmentIntersection(
+        const geometry_msgs::Point &p1,
+        const geometry_msgs::Point &p2,
+        double r)
+    {
+        // Formula for intersection of a line with a circle centered at the origin,
+        // modified to always return the point that is on the segment between the two points.
+        // https://mathworld.wolfram.com/Circle-LineIntersection.html
+        // This works because the poses are transformed into the robot frame.
+        // This can be derived from solving the system of equations of a line and a circle
+        // which results in something that is just a reformulation of the quadratic formula.
+        // Interactive illustration in doc/circle-segment-intersection.ipynb as well as at
+        // https://www.desmos.com/calculator/td5cwbuocd
+        double x1 = p1.x;
+        double x2 = p2.x;
+        double y1 = p1.y;
+        double y2 = p2.y;
+
+        double dx = x2 - x1;
+        double dy = y2 - y1;
+        double dr2 = dx * dx + dy * dy;
+        double D = x1 * y2 - x2 * y1;
+
+        // Augmentation to only return point within segment
+        double d1 = x1 * x1 + y1 * y1;
+        double d2 = x2 * x2 + y2 * y2;
+        double dd = d2 - d1;
+
+        geometry_msgs::Point p;
+        double sqrt_term = std::sqrt(r * r * dr2 - D * D);
+        p.x = (D * dy + std::copysign(1.0, dd) * dx * sqrt_term) / dr2;
+        p.y = (-D * dx + std::copysign(1.0, dd) * dy * sqrt_term) / dr2;
+        return p;
+    }
+
     //Get lookahead point on the global plan
     geometry_msgs::PoseStamped RegulatedPurePursuitController::getLookAheadPoint(
         const double & lookahead_dist, const std::vector<geometry_msgs::PoseStamped>& transformed_plan)
@@ -446,8 +510,26 @@ namespace regulated_pure_pursuit_controller
         });
 
         // If the number of poses is not far enough, take the last pose
-        if (goal_pose_it == transformed_plan.end()) {
+        if (goal_pose_it == transformed_plan.end())
+        {
             goal_pose_it = std::prev(transformed_plan.end());
+        }
+        else if (goal_pose_it != transformed_plan.begin())
+        {
+            // Find the point on the line segment between the two poses
+            // that is exactly the lookahead distance away from the robot pose (the origin)
+            // This can be found with a closed form for the intersection of a segment and a circle
+            // Because of the way we did the std::find_if, prev_pose is guaranteed to be inside the circle,
+            // and goal_pose is guaranteed to be outside the circle.
+            auto prev_pose_it = std::prev(goal_pose_it);
+            auto point = circleSegmentIntersection(
+                prev_pose_it->pose.position,
+                goal_pose_it->pose.position, lookahead_dist);
+            geometry_msgs::PoseStamped pose;
+            pose.header.frame_id = prev_pose_it->header.frame_id;
+            pose.header.stamp = goal_pose_it->header.stamp;
+            pose.pose.position = point;
+            return pose;
         }
 
         return *goal_pose_it;
@@ -468,6 +550,7 @@ namespace regulated_pure_pursuit_controller
         return lookahead_dist;
     }
 
+    
 
     bool RegulatedPurePursuitController::transformGlobalPlan(
         const tf2_ros::Buffer& tf, const std::vector<geometry_msgs::PoseStamped>& global_plan,
